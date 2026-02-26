@@ -1,6 +1,7 @@
 import time
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 pd.set_option("display.max_rows", None)
 pd.set_option("display.float_format", "{:.6f}".format)
 
@@ -19,10 +20,10 @@ def preprocess_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.dropna()
     df = df.drop(columns=[c for c in df.columns if df[c].nunique() == 1])
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
-    split_cols = ["id", "Flow ID", "Attempted Category", "Label"]
+    split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp"]
     #print(df.info())
     #print(df.mean(numeric_only=True))
-    return (df.drop(columns=split_cols), df.loc[:, split_cols])
+    return (df.drop(columns=split_cols), df[split_cols])
 
 def display_ip_io_fv(fv: np.ndarray):
     width = 20
@@ -30,13 +31,15 @@ def display_ip_io_fv(fv: np.ndarray):
     print("".join(f"{v:<{width}.3f}" for v in np.round(fv, 3)))
 
 
+
 class FlowNode:
-    def __init__(self, fv: np.ndarray, feature_len: int, src: str, dst: str):
+    def __init__(self, flow_id: int, fv: np.ndarray, src: str, dst: str):
+        self._flow_id = flow_id
         self._src: str = src
         self._dst: str = dst
         self._fv: np.ndarray = fv
         self._degree: int = 0
-        self._mean_fv: np.ndarray = np.zeros(feature_len, dtype=np.float64)
+        self._mean_fv: np.ndarray = np.zeros(len(fv), dtype=np.float64)
 
     def update_fv(self, x: np.ndarray):
         self._degree += 1
@@ -46,6 +49,64 @@ class FlowNode:
         print(f"Src: {self._src}")
         print(f"Dst: {self._dst}")
         print(self._fv)
+
+
+class FlowGraph:
+    def __init__(self, feature_len: int):
+        self._feature_len: int = feature_len
+        self._nodes: dict[int, FlowNode] = {}
+        self._edges: defaultdict[int, set[int]] = defaultdict(set)
+        self._src_grp: defaultdict[str, list[int]] = defaultdict(list)
+        self._dst_grp: defaultdict[str, list[int]] = defaultdict(list)
+        self._fullmatch_grp: defaultdict[tuple[str, str, int, int, int], list[int]] = defaultdict(list)
+
+
+    def insert_flow(self, flow_id: int, src: str, dst: str, features: np.ndarray):
+        if flow_id not in self._nodes:
+
+            self._nodes[flow_id] = FlowNode(flow_id, features, src, dst)
+            self._src_grp[src].append(flow_id)
+            self._dst_grp[dst].append(flow_id)
+            self._fullmatch_grp[(src, dst, int(features[feature_idx_map["Src Port"]]), int(features[feature_idx_map["Dst Port"]]), int(features[feature_idx_map["Protocol"]]))].append(flow_id)
+
+    def add_edge(self, src_id: int, dst_id: int):
+        src = self._nodes[src_id]
+        dst = self._nodes[dst_id]
+        self._edges[src_id].add(dst_id)
+        self._edges[dst_id].add(src_id)
+
+
+    def find_edges(self):
+        pass
+
+
+    def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
+        features = data.to_numpy(dtype=np.float64)
+        flow_data = ids[["Src IP", "Dst IP", "id"]].to_numpy()
+        start = time.perf_counter()
+        for i in range(len(features)):
+            #print(f"src: {flow_ips[i, 0]}, dst: {flow_ips[i, 1]}")
+            self.insert_flow(flow_data[i, 2], flow_data[i, 0], flow_data[i, 1], features[i])
+        self.find_edges()
+        end = time.perf_counter()
+        print(f"Graph built in {end-start:.6f}s")
+
+    def structure(self):
+        print("Nodes: ", len(self._nodes))
+        edges = sum([len(edge) for edge in self._edges.values()])
+        print("Edges: ", edges/2)
+        print(f"dst:{len(self._dst_grp)}\nsrc:{len(self._src_grp)}\nfull:{len(self._fullmatch_grp)}")
+
+    def get_neighbours_by_id(self, id: int) -> set[int]:
+        if id > len(self._nodes)-1:
+            raise ValueError("id does not exist")
+        return self._edges[id]
+
+    def structure_of(self, id: int):
+        if id not in self._nodes:
+            raise ValueError("id does not exist")
+        self._nodes[id].structure()
+
 
 
 
@@ -99,9 +160,9 @@ class IpGraph:
         #print("" + "".join(f"{v:<{20}}" for v in np.round(inverted_features, 3)))
         self._nodes[dst_id].update_fv(inverted_features)
 
-    def initialize(self, data: pd.DataFrame):
+    def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
         features = data[ALL_IP_FEATURES].to_numpy(dtype=np.float64)
-        flow_ips = data[["Src IP", "Dst IP"]].to_numpy()
+        flow_ips = ids[["Src IP", "Dst IP"]].to_numpy()
         start = time.perf_counter()
         for i in range(len(features)):
             #print(f"src: {flow_ips[i, 0]}, dst: {flow_ips[i, 1]}")
@@ -149,12 +210,16 @@ class IpGraph:
 
 
 
-clean_data, unused = preprocess_data(data)
+clean_data, identification_data = preprocess_data(data)
 
-graph = IpGraph()
-graph.initialize(clean_data)
+
+feature_idx_map = {}
+for (idx, feature_name) in enumerate(clean_data.columns.values):
+    feature_idx_map[feature_name] = idx
+
+graph = FlowGraph(len(clean_data))
+#graph = IpGraph()
+graph.initialize(clean_data, identification_data)
 
 graph.structure()
-graph.structure_of(2)
-print(graph.get_neighbours_by_id(2))
-graph.find_anomalies()
+#graph.find_anomalies()
