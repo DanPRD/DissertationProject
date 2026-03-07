@@ -21,6 +21,8 @@ FEATURE_CLIP_MAX = 10
 ALPHA = 0 # weight of local signal 0 = global only 1 = local only
 MIN_EDGES = 3 
 ENERGY_THRESHOLD_SCALAR = 1.7
+VERBOSE = False
+FEATURES_TO_DISPLAY = 5
 
 start = time.perf_counter()
 df_monday = pd.read_csv("./monday.csv")
@@ -29,6 +31,7 @@ after_read = time.perf_counter()
 print(f"Dataset read time: {after_read-start:.6f}s")
 
 # 'Packet Length Mean' and 'Average Packet Size' seem to just be the same value with very minor changes, like 0.01 difference
+# maybe remove source/dst port since it doesnt give that much info, and more often than not gives energy which isnt relevant, since nodes often use many different ports, same with protocol
 def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     df = df.dropna()
     #df = df.drop(columns=[c for c in df.columns if df[c].nunique() == 1])
@@ -45,7 +48,6 @@ def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     mins = df.min() 
     denom = (df.max() - mins).replace(0, 1)
     df = (df - mins) / denom # original = scaled * denom + mins 
-    print(df.mean(numeric_only=True)) 
     return (df, identification_data, mins, denom)
 
 
@@ -66,8 +68,7 @@ def process_test_data(df: pd.DataFrame, mins: pd.Series, denom: pd.Series) -> tu
 
 
     df = (df - mins) / denom
-    df = df.clip(lower=-FEATURE_CLIP_MAX, upper=FEATURE_CLIP_MAX)  
-    print(df.mean(numeric_only=True)) 
+    #df = df.clip(lower=-FEATURE_CLIP_MAX, upper=FEATURE_CLIP_MAX)  
     return (df, identification_data)
 
 
@@ -171,6 +172,19 @@ class BaselineGraph:
         var_floored = np.maximum(var, self.global_var * 0.01)
 
         return float(np.sum((fv - mean) ** 2 / var_floored))
+
+    def perf_energy(self, fv: np.ndarray, dst: str) -> np.ndarray:
+        mean = self.dst_mean.get(dst, self.global_mean)
+        var = self.dst_var.get(dst, self.global_var)
+
+        # var must be 1% of global
+        var_floored = np.maximum(var, self.global_var * 0.01)
+
+        return ((fv - mean) ** 2 / var_floored)
+
+    
+    def get_baselines(self, dst: str) -> tuple[np.ndarray, np.ndarray]:
+        return (self.dst_mean.get(dst, self.global_mean), self.dst_var.get(dst, self.global_var))
 
     def initialize_from_df(self, data: pd.DataFrame, ids: pd.DataFrame):
         features = data.to_numpy(dtype=np.float64)
@@ -283,6 +297,69 @@ class FlowGraph:
             print(f"{header}: {lhs} - {rhs}")
 
 
+    def explain_prediction(self, flow_id):
+        print("-"*120)
+        denom_n = denom.to_numpy()
+        mins_n = mins.to_numpy()
+        feature_names = list(test_data.columns)
+        node = self._nodes[flow_id]
+        initial_features = (node.fv*denom_n) + mins_n
+        features = node.fv
+        baseline_mean, baseline_variance = self._baseline.get_baselines(node.dst)
+        initial_stdev = baseline_variance * denom_n
+        initial_mean = (baseline_mean*denom_n) + mins_n 
+        difference = features - baseline_mean
+        energy = self.combined_energy(node)
+        perf_energy = self._baseline.perf_energy(node.fv, node.dst)
+        sorted_perf_energy = np.argsort(perf_energy)[::-1]
+        prediction = energy > self._baseline.energy_threshold
+        label = test_identification.at[flow_id, "Label"]
+        is_malicious = label != "BENIGN"
+        rows = [{
+            "FEATURE": feature_names[idx],
+            "INIT VALUE": initial_features[idx],
+            "VALUE": features[idx],
+            "INIT MEAN": initial_mean[idx],
+            "BASE MEAN": baseline_mean[idx],
+            "DIFFERENCE": difference[idx],
+            "INIT STDEV": initial_stdev[idx],
+            "BASE VARIANCE": baseline_variance[idx],
+            "GLOB VARIANCE": self._baseline.global_var[idx],
+            "ENERGY": perf_energy[idx],
+        } for idx in sorted_perf_energy]
+        table = pd.DataFrame(rows)
+        srcip = test_identification.at[flow_id, "Src IP"]
+        dstip = test_identification.at[flow_id, "Dst IP"]
+        srcp = int((features[feature_idx_map["Src Port"]]*denom["Src Port"])+mins["Src Port"])
+        dstp = int((features[feature_idx_map["Dst Port"]]*denom["Dst Port"])+mins["Dst Port"])
+        if VERBOSE:
+            print(table.to_string(index=False, float_format="%.6f"))
+            print(f"Source Address:      {srcip}:{srcp}")
+            print(f"Destination Address: {dstip}:{dstp}")
+
+        else:
+            print(f"Top {FEATURES_TO_DISPLAY} Feature Contributions for flow {flow_id}: ({srcip}:{srcp} -> {dstip}:{dstp})")
+            for (idx, row) in table.head(FEATURES_TO_DISPLAY).iterrows():
+                sign_text = "increased" if row["DIFFERENCE"] >= 0 else "decreased"
+                var_text: str
+                if row["BASE VARIANCE"] >= 0.01:
+                    var_text = "high"
+                elif row["BASE VARIANCE"] >= 0.005:
+                    var_text = "normal"
+                else:
+                    var_text = "low"
+                scaled_difference = abs((row["DIFFERENCE"]*denom[row["FEATURE"]]) + mins[row["FEATURE"]])
+                print(f"{row["FEATURE"]:>30} {sign_text} by {scaled_difference:>14,.3f} compared to the destination IP mean of {row["INIT MEAN"]:>14,.3f} paired with a {var_text:<6} standard deviation of {row["INIT STDEV"]:>16,.6f} contributed {row["ENERGY"]:,.3f} energy to total")
+
+        print(f"Total Energy: {energy:.2f}")
+        print(f"Predicted anomalous: {prediction}")
+        print(f"Real Label: {label}")
+        print(f"Flow Timestamp: {test_identification.at[flow_id, "Timestamp"]}") 
+
+
+
+
+
     def find_anomalies(self, test_identification: pd.DataFrame):
         start = time.perf_counter()
         print("finding anomalies")
@@ -291,7 +368,15 @@ class FlowGraph:
         true_is_malicious = []
         flow_ids = list(self._nodes.keys())
 
+
+        c = 0
         for id, node in self._nodes.items():
+
+            if c < 30:
+                self.explain_prediction(id)
+            elif c == 30:
+                print("-"*120)
+            c += 1
             label = test_identification.at[id, "Label"]
             is_malicious = label != "BENIGN"
             energy = self.combined_energy(node)
@@ -316,12 +401,9 @@ class FlowGraph:
         tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
 
-        print(f"predicited benign, actually malicious (FN): {fn}")
-        print(f"predicited malicious, actually benign (FP): {fp}")
+
         print(f"Total Incorrect: {fn + fp}")
         print(f"Total Correct: {tn + tp}")
-        print(f"Total predicted anomalies (mal): {tp}")
-        print(f"Total predicted benign: {tn}")
         print(f"Total Nodes: {len(self._nodes.keys())}")
         after_read = time.perf_counter()
         print(f"Find anomalies time: {after_read-start:.6f}s")
@@ -385,6 +467,25 @@ class FlowGraph:
             print(f"top energy-contributing features for {top_ip_to_check} FPs:")
             for idx in top_features:
                 print(f"  {feature_names[idx]}: mean_contribution={per_feature_energy[idx]:.1f} fp_mean={fp_fvs[:,idx].mean():.4f}  baseline_mean={dst_mean[idx]:.4f}")
+
+            dst_port_idx = feature_idx_map["Dst Port"]
+
+            fp_ports = [
+                int(round(graph._nodes[flow_ids[i]].fv[dst_port_idx] * denom["Dst Port"] + mins["Dst Port"]))
+                for i in range(len(flow_ids))
+                if predictions[i] and not true_is_malicious[i]
+            ]
+
+            fn_ports = [
+                int(round(graph._nodes[flow_ids[i]].fv[dst_port_idx] * denom["Dst Port"] + mins["Dst Port"]))
+                for i in range(len(flow_ids))
+                if not predictions[i] and true_is_malicious[i]
+            ]
+
+            print("\nTop 5 FP ports")
+            print(pd.Series(fp_ports).value_counts().head(5))
+            print("\nTop 5 FN ports")
+            print(pd.Series(fn_ports).value_counts().head(5))
 
     def plot(self, all_energies, true_is_malicious, threshold, fpr_curve, tpr_curve, roc_auc, fpr_op, tpr_op):
         benign_energy = all_energies[~true_is_malicious]
@@ -541,8 +642,8 @@ common_cols = benign_data.columns
 test_data, test_identification = process_test_data(data, mins, denom)
 test_data = test_data.reindex(columns=common_cols, fill_value=0.0)
 
-print("scaled test feature ranges:")
-print(test_data.abs().max().sort_values(ascending=False).head(15))
+print("\nscaled test feature maximums:")
+print(test_data.abs().max().sort_values(ascending=False).head(25))
 
 feature_idx_map = {}
 for (idx, feature_name) in enumerate(test_data.columns.values):
@@ -564,7 +665,7 @@ else:
 
     graph = FlowGraph(feature_len=len(benign_data.columns), timestart=timestart, baseline=baseline)
     graph.initialize(test_data, test_identification)
-    pickle.dump(graph, open("graph.bin", "wb"), protocol=pickle.HIGHEST_PROTOCOL)
+    #pickle.dump(graph, open("graph.bin", "wb"), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 check = 362075
