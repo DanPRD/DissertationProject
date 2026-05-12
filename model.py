@@ -1,11 +1,10 @@
+import os
 import json
 from pathlib import Path
 import time
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from sklearn.metrics import roc_curve, auc, fbeta_score
 pd.set_option("display.max_rows", None)
 pd.set_option("display.float_format", "{:.6f}".format)
@@ -498,7 +497,8 @@ class FlowGraph:
                 "detection_time": detect_time,
                 }
 
-        filepath = f"./saves/timed-all/{label}"
+        filepath = f"./saves/{label}"
+        os.makedirs(filepath, exist_ok=True)
         with open(filepath, "w") as f:
             json.dump(snapshot, f)
 
