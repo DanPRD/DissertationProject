@@ -1,12 +1,12 @@
+import json
+from pathlib import Path
 import time
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-import pickle
 import matplotlib.pyplot as plt
-import scipy.stats as stats
 import matplotlib.gridspec as gridspec
-from sklearn.metrics import roc_curve, auc, f1_score
+from sklearn.metrics import roc_curve, auc, f1_score, fbeta_score
 pd.set_option("display.max_rows", None)
 pd.set_option("display.float_format", "{:.6f}".format)
 
@@ -15,20 +15,17 @@ OUT_FEATURES = ["Total Fwd Packet", "Fwd Packets/s"]  # "Dst Port",
 IN_FEATURES = ["Total Bwd packets", "Bwd Packets/s"]  # "Src Port",
 ALL_IP_FEATURES = IO_FEATURES + OUT_FEATURES + IN_FEATURES
 
-TIME_BIN_SIZE_S = 1.5
+TIME_BIN_SIZE_S = 180
 TIME_BIN_SIZE = TIME_BIN_SIZE_S * 1000000
-FEATURE_CLIP_MAX = 10
-ALPHA = 0 # weight of local signal 0 = global only 1 = local only
-MIN_EDGES = 3 
-ENERGY_THRESHOLD_SCALAR = 1.7
-VERBOSE = False
+ALPHA = 1 # weight of local signal 0 = global only 1 = local only
+MIN_EDGES = 3
+ENERGY_THRESHOLD_SCALAR = 1.4
+VERBOSE = True
 FEATURES_TO_DISPLAY = 5
-
-start = time.perf_counter()
-df_monday = pd.read_csv("./monday.csv")
-data = pd.read_csv("./thursday.csv")
-after_read = time.perf_counter()
-print(f"Dataset read time: {after_read-start:.6f}s")
+VAR_MINIMUM = 0.01
+TOPK = 5
+protocol_map = {6: "TCP", 17: "UDP", 1: "ICMP"}
+type FlowId = np.int32
 
 # 'Packet Length Mean' and 'Average Packet Size' seem to just be the same value with very minor changes, like 0.01 difference
 # maybe remove source/dst port since it doesnt give that much info, and more often than not gives energy which isnt relevant, since nodes often use many different ports, same with protocol
@@ -38,11 +35,11 @@ def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
     #df.loc[df["Attempted Category"] != -1, "Label"] = "BENIGN"
 
-    split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp"]
+    split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp", "Protocol"]
 
     identification_data = df[split_cols].copy()
     identification_data = identification_data.set_index("id", drop=False)
-
+    split_cols.remove("Protocol")
     df = df.drop(columns=split_cols)
 
     mins = df.min() 
@@ -57,12 +54,12 @@ def process_test_data(df: pd.DataFrame, mins: pd.Series, denom: pd.Series) -> tu
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
     df.loc[df["Attempted Category"] != -1, "Label"] = "BENIGN"
 
-    split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp"]
+    split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp", "Protocol"]
 
     identification_data = df[split_cols].copy()
     identification_data = identification_data.set_index("id", drop=False)
 
-
+    split_cols.remove("Protocol")
     df = df.drop(columns=split_cols)
     df = df.reindex(columns=mins.index, fill_value=0.0)
 
@@ -81,23 +78,47 @@ def display_ip_io_fv(fv: np.ndarray):
 
 
 def to_microseconds(timestamp: str) -> int:
-    t = timestamp[11:]
     return (
-        int(t[0:2]) * 3_600_000_000 +
-        int(t[3:5]) *   60_000_000 +
-        int(t[6:8]) *    1_000_000 +
-        int(t[9:15])
+        int(timestamp[8:10]) * 1000000 * 60 * 60 * 24 + # day
+        int(timestamp[11:13]) * 1000000 * 60 * 60+  # hours
+        int(timestamp[14:16]) * 1000000 * 60 +  # minutes
+        int(timestamp[17:19]) * 1000000 +  # seconds
+        int(timestamp[20:26])    # microseconds
     )
 
 
+
+def update_running_variance_batch(old_mean, old_M2, old_n, new_values):
+    new_n = len(new_values)
+    total_n = old_n + new_n
+
+    if total_n == 0:
+        return old_mean, old_M2, total_n, old_mean * 0
+
+    new_mean_batch = new_values.mean(axis=0)
+    new_mean = (old_mean * old_n + new_mean_batch * new_n) / total_n
+
+    new_M2_batch = ((new_values - new_mean_batch) ** 2).sum(axis=0)
+
+    correction = old_n * new_n / total_n * ((old_mean - new_mean_batch) ** 2)
+
+    new_M2 = old_M2 + new_M2_batch + correction
+    new_variance = new_M2 / (total_n - 1) if total_n > 1 else np.zeros_like(new_mean)
+
+    return new_mean, new_M2, total_n, new_variance
+
 class FlowNode:
-    def __init__(self, flow_id: int, fv: np.ndarray, src: str, dst: str):
-        self.flow_id: int = flow_id
+    def __init__(self, flow_id: FlowId, fv: np.ndarray, src: str, dst: str, dstp: int):
+        self.dstp = dstp
+        self.flow_id: FlowId = flow_id
         self.src: str = src
         self.dst: str = dst
         self.fv: np.ndarray = fv
         self.degree: int = 0
+        self.real_degree: int = 0
+        self.m2: np.ndarray = np.zeros(len(fv))
         self.mean_fv: np.ndarray = np.zeros(len(fv), dtype=np.float64)
+        self.peer_var: np.ndarray = np.zeros(len(fv))
 
 
     def update_fv(self, x: np.ndarray):
@@ -115,19 +136,23 @@ class BaselineGraph:
     def __init__(self, feature_len: int):
         self._feature_len = feature_len
         self._dst_fvs: defaultdict[str, list[np.ndarray]] = defaultdict(list)
-        self._src_fvs: defaultdict[str, list[np.ndarray]] = defaultdict(list)
+        #self._src_fvs: defaultdict[str, list[np.ndarray]] = defaultdict(list)
         self.dst_mean: dict[str, np.ndarray] = {}
         self.dst_var: dict[str, np.ndarray] = {}
-        self.src_mean: dict[str, np.ndarray] = {}
+        #self.src_mean: dict[str, np.ndarray] = {}
         self.global_mean: np.ndarray = np.zeros(feature_len)
         self.global_var: np.ndarray = np.ones(feature_len)
         self.energy_threshold: float = 0.0
 
-    def add_flow(self, src: str, dst: str, features: np.ndarray):
+
+
+
+    def add_flow(self, src: str, dst: str, protocol: int, features: np.ndarray):
         self._dst_fvs[dst].append(features)
-        self._src_fvs[src].append(features)
+        #self._src_fvs[src].append(features)
 
     def build(self, threshold_percentile: float = 99.5):
+        start = time.perf_counter()
         all_fvs = np.vstack(list(self._dst_fvs.values()))
         self.global_mean = all_fvs.mean(axis=0)
         global_v = all_fvs.var(axis=0)
@@ -139,12 +164,8 @@ class BaselineGraph:
             arr = np.array(fvs)
             self.dst_mean[dst] = arr.mean(axis=0)
             v = arr.var(axis=0)
-            v = np.maximum(v, self.global_var * 0.01)
+            v = np.maximum(v, self.global_var * VAR_MINIMUM)
             self.dst_var[dst] = v
-
-        for src, fvs in list(self._src_fvs.items()):
-            self.src_mean[src] = np.array(fvs).mean(axis=0)
-
 
         benign_energies = []
         for dst in list(self.dst_mean.keys()):  
@@ -159,89 +180,166 @@ class BaselineGraph:
         std = log_energies.std()
  
         self.energy_threshold = 10 ** (mu + ENERGY_THRESHOLD_SCALAR * std)
-
+        end = time.perf_counter()
         print(f"baseline built: {len(all_fvs)} flows, {len(self.dst_mean)} unique dsts")
+        print(f"baseline built in: {start-end:.6f}")
         print(f"monday log-energy: mu={mu:.2f}, std={std:.2f}")
         print(f"energy threshold (mu+{ENERGY_THRESHOLD_SCALAR}σ): {self.energy_threshold:.2f}")
 
-    def global_energy(self, fv: np.ndarray, dst: str) -> float:
+    def global_energy(self, fv: np.ndarray, dst: str, protocol: int) -> float:
         mean = self.dst_mean.get(dst, self.global_mean)
         var = self.dst_var.get(dst, self.global_var)
 
         # var must be 1% of global
-        var_floored = np.maximum(var, self.global_var * 0.01)
+        var_floored = np.maximum(var, self.global_var * VAR_MINIMUM)
 
         return float(np.sum((fv - mean) ** 2 / var_floored))
 
-    def perf_energy(self, fv: np.ndarray, dst: str) -> np.ndarray:
+    def perf_energy(self, fv: np.ndarray, dst: str, protocol: int) -> np.ndarray:
         mean = self.dst_mean.get(dst, self.global_mean)
         var = self.dst_var.get(dst, self.global_var)
 
         # var must be 1% of global
-        var_floored = np.maximum(var, self.global_var * 0.01)
+        var_floored = np.maximum(var, self.global_var * VAR_MINIMUM)
 
         return ((fv - mean) ** 2 / var_floored)
 
-    
-    def get_baselines(self, dst: str) -> tuple[np.ndarray, np.ndarray]:
-        return (self.dst_mean.get(dst, self.global_mean), self.dst_var.get(dst, self.global_var))
+
+    def get_baselines(self, dst: str, protocol: int) -> tuple[np.ndarray, np.ndarray]:
+        return (self.dst_mean.get(dst, self.global_mean), np.maximum(self.dst_var.get(dst, self.global_var), self.global_var * VAR_MINIMUM))
 
     def initialize_from_df(self, data: pd.DataFrame, ids: pd.DataFrame):
         features = data.to_numpy(dtype=np.float64)
-        flow_data = ids[["Src IP", "Dst IP"]].to_numpy()
+        flow_data = ids[["Src IP", "Dst IP", "Protocol"]].to_numpy()
         for i in range(len(features)):
-            self.add_flow(flow_data[i, 0], flow_data[i, 1], features[i])
+            self.add_flow(flow_data[i, 0], flow_data[i, 1], flow_data[i, 2], features[i])
         self.build()
 
 
 class FlowGraph:
     def __init__(self, feature_len: int, timestart: int, baseline: BaselineGraph):
         self._feature_len: int = feature_len
-        self._nodes: dict[int, FlowNode] = {}
-        self._edges: defaultdict[int, set[int]] = defaultdict(set)
-        self._src_grp: defaultdict[str, set[int]] = defaultdict(set)
-        self._dst_grp: defaultdict[str, set[int]] = defaultdict(set)
+        self._nodes: dict[FlowId, FlowNode] = {}
+        self._edges: defaultdict[FlowId, set[FlowId]] = defaultdict(set)
+        self._src_grp: defaultdict[str, set[FlowId]] = defaultdict(set)
+        self._dst_grp: defaultdict[str, set[FlowId]] = defaultdict(set)
         self._fullmatch_grp: defaultdict[tuple[str, str, int, float], set[int]] = defaultdict(set)
         self._timestart = timestart
         self._baseline = baseline
+        self.build_time = 0
+        self.detect_time = 0
 
 
-    def insert_flow(self, flow_id: int, src: str, dst: str, timestamp: str, features: np.ndarray, ):
+    def insert_flow(self, flow_id: FlowId, src: str, dst: str, timestamp: str, dstp: int, features: np.ndarray, ):
         if flow_id not in self._nodes:
+            self._nodes[flow_id] = FlowNode(flow_id, features, src, dst, dstp)
+            #self._src_grp[src].add(flow_id)
+            #self._dst_grp[dst].add(flow_id)
+            #time_bin = (to_microseconds(timestamp) - self._timestart) // TIME_BIN_SIZE
+            #self._fullmatch_grp[(src, dst, int(features[feature_idx_map["Protocol"]]), time_bin)].add(flow_id)
 
-            self._nodes[flow_id] = FlowNode(flow_id, features, src, dst)
-            self._src_grp[src].add(flow_id)
-            self._dst_grp[dst].add(flow_id)
-            time_bin = (to_microseconds(timestamp) - self._timestart) // TIME_BIN_SIZE
-            self._fullmatch_grp[(src, dst, int(features[feature_idx_map["Protocol"]]), time_bin)].add(flow_id)
+
 
     def find_edges(self):
-        start = time.perf_counter()
+        flow_id_list = list(self._nodes.keys())
+        fid_to_idx = {fid:i for i, fid in enumerate(flow_id_list)}
+        fvs          = np.array([self._nodes[i].fv for i in flow_id_list])
 
-        for (key, edge_set) in self._fullmatch_grp.items():
-            #print(f"{key}: ({len(edge_set)})")
-            for flow_id in edge_set:
-                new_edges = edge_set.difference({flow_id})
-                self._edges[flow_id] = self._edges[flow_id].union(new_edges)
-                for edge_id in new_edges:
-                    self._nodes[flow_id].update_fv(self._nodes[edge_id].fv)
-        after_read = time.perf_counter()
-        print(f"Find edges time: {after_read-start:.6f}s")
+        energies = np.array([
+            self._baseline.global_energy(self._nodes[i].fv, self._nodes[i].dst, 0)
+            for i in flow_id_list
+            ])
+        is_benign = energies < self._baseline.energy_threshold
+        print(f"Benign candidates: {is_benign.sum():,} / {len(flow_id_list):,}")
+
+        def apply_group(cluster_name: str, key_fn):
+            clusters: defaultdict[int, list[FlowId]] = defaultdict(list)
+            for idx in flow_id_list:
+                clusters[key_fn(idx)].append(idx)
+
+            total_clusters = len(clusters)
+            #print(f"\n{cluster_name}: {total_clusters:,} groups")
+
+            for cluster_num, (cluster_key, flowids_in_cluster) in enumerate(clusters.items(), 1):
+                #if cluster_num % 2500 == 0:
+                    #print(f"\033[1G\033[2K{cluster_num}", end="", flush=True)
+                #print(f"\033[1G\033[2K{cluster_num} ({len(flowids_in_cluster)} flows): {cluster_num:,} / {total_clusters:,} groups processed", end="", flush=True)
+                #print( "", end="", flush=True )
+
+                benign_idxs = [fid_to_idx[fid] for fid in flowids_in_cluster if is_benign[fid_to_idx[fid]]]
+                if not benign_idxs:
+                    continue
+
+                for fid in flowids_in_cluster:
+                    i = fid_to_idx[fid]
+                    node = self._nodes[fid]
+                    new_peers = [j for j in benign_idxs if j != i and flow_id_list[j] not in self._edges[fid]]
+                    if not new_peers:
+                        continue
+                    #new_peers_mean = fvs[new_peers].mean(axis=0)
+                    #new_peers_var = fvs[new_peers].var(axis=0)
+                    #n_new = len(new_peers)
+                    #total = node.degree + n_new
+                    node.mean_fv, node.m2, node.degree, node.peer_var = update_running_variance_batch(
+                        node.mean_fv,
+                        node.m2,
+                        node.degree,
+                        fvs[new_peers]
+                    )
+                    #self._edges[fid].update([flow_id_list[j] for j in new_peers])
+                    #node.mean_fv   = (node.mean_fv * node.degree + new_peers_mean * n_new) / total
+                    #node.peer_var = (node.peer_var * node.degree + new_peers_var * n_new) / total
+                    #node.degree    = total
+                    node.real_degree += len(flowids_in_cluster) - 1
+
+            print(f"\n{cluster_name}: {total_clusters:,} / {total_clusters:,} groups done")
+
+        #apply_group("Layer1 (src+dst)", lambda i: (srcs[i], dsts[i]))
+        apply_group("Layer2 (dst)",     lambda i: (self._nodes[i].dst, (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
+        apply_group("Layer3 (dstport)", lambda i: (self._nodes[i].fv[feature_idx_map["Dst Port"]], (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
+
 
     def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
-        features = data.to_numpy(dtype=np.float64)
-        flow_data = ids[["id", "Src IP", "Dst IP", "Timestamp"]].to_numpy()
         start = time.perf_counter()
+        features = data.to_numpy(dtype=np.float64)
+        flow_data = ids[["id", "Src IP", "Dst IP", "Timestamp", "Protocol"]].to_numpy()
         for i in range(len(features)):
-            self.insert_flow(flow_data[i, 0], flow_data[i, 1], flow_data[i, 2], flow_data[i, 3], features[i])
+            self.insert_flow(np.int32(flow_data[i, 0]), flow_data[i, 1], flow_data[i, 2], flow_data[i, 3], flow_data[i, 4], features[i])
 
+
+
+        print(f"Finding Edges")
+        self.find_edges()
         end = time.perf_counter()
-        print(f"Graph built in {end-start:.6f}s")
-        #print(f"Finding Edges")
-        #self.find_edges()
+        print(f"Graph and edges built in {end-start:.6f}s")
+        self.build_time = end-start
 
     def combined_energy(self, node: FlowNode) -> float:
-        return self._baseline.global_energy(node.fv, node.dst)
+        global_e = self._baseline.global_energy(node.fv, node.dst, node.dstp)
+        if node.degree < MIN_EDGES:
+            return global_e
+
+        var_floored = np.maximum(node.peer_var, self._baseline.global_var * VAR_MINIMUM)
+        local_residual = node.fv - node.mean_fv
+        local_e = float(np.sum(local_residual ** 2 / var_floored))
+
+        return ((1 - ALPHA) * global_e) + (ALPHA * local_e)
+
+    def energy_parts(self, node: FlowNode) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        global_per_feature = self._baseline.perf_energy(node.fv, node.dst, node.dstp)
+        global_e = float(global_per_feature.sum())
+
+        if node.degree < MIN_EDGES:
+            local_per_feature = np.zeros(self._feature_len)
+            return global_per_feature, local_per_feature, global_per_feature 
+
+        var_floored = np.maximum(node.peer_var, self._baseline.global_var * VAR_MINIMUM)
+        local_residual = node.fv - node.mean_fv
+        local_per_feature = (local_residual ** 2 / var_floored)
+        local_e = float(local_per_feature.sum())
+
+        combined = ((1 - ALPHA) * global_per_feature) + (ALPHA * local_per_feature)
+        return global_per_feature, local_per_feature, combined
 
     def structure(self):
         print("Nodes: ", len(self._nodes))
@@ -262,7 +360,7 @@ class FlowGraph:
         # Diagnose WHO the zero-edge nodes are
         zero_edge_ids = [id for id in self._nodes if len(self._edges[id]) == 0]
 
-        labels = test_identification.loc[zero_edge_ids, "Label"]
+        labels = test_identification.loc[[int(i) for i in zero_edge_ids], "Label"]
         print(f"Zero-edge nodes that are BENIGN: {(labels == 'BENIGN').sum()}")
         print(f"Zero-edge nodes that are MALICIOUS: {(labels != 'BENIGN').sum()}")
 
@@ -279,12 +377,12 @@ class FlowGraph:
         print(f"\nMalicious edge count stats:")
         print(edge_counts[edge_counts.index.isin(mal_ids)].describe())
 
-    def get_neighbours_by_id(self, id: int) -> set[int]:
+    def get_neighbours_by_id(self, id: FlowId) -> set[int]:
         if id > len(self._nodes)-1:
             raise ValueError("id does not exist")
         return self._edges[id]
 
-    def structure_of(self, id: int):
+    def structure_of(self, id: FlowId):
         if id not in self._nodes:
             raise ValueError("id does not exist")
         print(f"FLOW ID {id}--------------------")
@@ -298,47 +396,57 @@ class FlowGraph:
 
 
     def explain_prediction(self, flow_id):
-        print("-"*120)
+        print("\n\n" + "-"*120)
         denom_n = denom.to_numpy()
         mins_n = mins.to_numpy()
         feature_names = list(test_data.columns)
         node = self._nodes[flow_id]
         initial_features = (node.fv*denom_n) + mins_n
         features = node.fv
-        baseline_mean, baseline_variance = self._baseline.get_baselines(node.dst)
+        baseline_mean, baseline_variance = self._baseline.get_baselines(node.dst, node.dstp)
         initial_stdev = baseline_variance * denom_n
         initial_mean = (baseline_mean*denom_n) + mins_n 
+        initial_mean_fv = (node.mean_fv*denom_n) + mins_n
         difference = features - baseline_mean
         energy = self.combined_energy(node)
-        perf_energy = self._baseline.perf_energy(node.fv, node.dst)
-        sorted_perf_energy = np.argsort(perf_energy)[::-1]
+        global_pf, local_pf, combined = self.energy_parts(node)
+        sorted_perf_energy = np.argsort(combined)[::-1]
         prediction = energy > self._baseline.energy_threshold
         label = test_identification.at[flow_id, "Label"]
         is_malicious = label != "BENIGN"
+        shannon = self.shannon_entropy(combined)
         rows = [{
             "FEATURE": feature_names[idx],
             "INIT VALUE": initial_features[idx],
             "VALUE": features[idx],
             "INIT MEAN": initial_mean[idx],
             "BASE MEAN": baseline_mean[idx],
+            "MEAN_FV": node.mean_fv[idx],
+            "INIT MEAN_FV": initial_mean_fv[idx],
             "DIFFERENCE": difference[idx],
             "INIT STDEV": initial_stdev[idx],
             "BASE VARIANCE": baseline_variance[idx],
-            "GLOB VARIANCE": self._baseline.global_var[idx],
-            "ENERGY": perf_energy[idx],
+            "PEER VARIANCE": node.peer_var[idx],
+            "Global Energy":  global_pf[idx],
+            "Local Energy":   local_pf[idx],
+            "ENERGY": combined[idx],
+
         } for idx in sorted_perf_energy]
         table = pd.DataFrame(rows)
         srcip = test_identification.at[flow_id, "Src IP"]
         dstip = test_identification.at[flow_id, "Dst IP"]
         srcp = int((features[feature_idx_map["Src Port"]]*denom["Src Port"])+mins["Src Port"])
         dstp = int((features[feature_idx_map["Dst Port"]]*denom["Dst Port"])+mins["Dst Port"])
+        protocol = protocol_map.get(int((features[feature_idx_map["Protocol"]]*denom["Protocol"])+mins["Protocol"]), "N/A")
         if VERBOSE:
-            print(table.to_string(index=False, float_format="%.6f"))
-            print(f"Source Address:      {srcip}:{srcp}")
+            print("VERBOSE-------------------------------------")
+            print(table.to_string(index=False, float_format="%.8f"))
+            print(f"Source Address: {srcip}:{srcp}")
             print(f"Destination Address: {dstip}:{dstp}")
-
+            print(f"Protocol: {protocol}")
         else:
-            print(f"Top {FEATURES_TO_DISPLAY} Feature Contributions for flow {flow_id}: ({srcip}:{srcp} -> {dstip}:{dstp})")
+            print("SIMPLE---------------------------------------")
+            print(f"Top {FEATURES_TO_DISPLAY} Feature Contributions for flow {flow_id}: ({srcip}:{srcp} -> {dstip}:{dstp}) ({protocol})")
             for (idx, row) in table.head(FEATURES_TO_DISPLAY).iterrows():
                 sign_text = "increased" if row["DIFFERENCE"] >= 0 else "decreased"
                 var_text: str
@@ -349,11 +457,13 @@ class FlowGraph:
                 else:
                     var_text = "low"
                 scaled_difference = abs((row["DIFFERENCE"]*denom[row["FEATURE"]]) + mins[row["FEATURE"]])
-                print(f"{row["FEATURE"]:>30} {sign_text} by {scaled_difference:>14,.3f} compared to the destination IP mean of {row["INIT MEAN"]:>14,.3f} paired with a {var_text:<6} standard deviation of {row["INIT STDEV"]:>16,.6f} contributed {row["ENERGY"]:,.3f} energy to total")
+                print(f"{row["FEATURE"]:>25} {sign_text} by {scaled_difference:,.3f} compared to the neighbour mean of {row["INIT MEAN"]:,.3f} paired with a {var_text} standard deviation of {row["INIT STDEV"]:,.6f} contributed {row["ENERGY"]:,.3f} total energy")
 
-        print(f"Total Energy: {energy:.2f}")
+        print(f"Total Energy: {energy:.2f} ({combined.sum()})")
         print(f"Predicted anomalous: {prediction}")
         print(f"Real Label: {label}")
+        print(f"Node Degree: {node.degree}")
+        print(f"Shannon: {shannon}")
         print(f"Flow Timestamp: {test_identification.at[flow_id, "Timestamp"]}") 
 
 
@@ -363,129 +473,179 @@ class FlowGraph:
     def find_anomalies(self, test_identification: pd.DataFrame):
         start = time.perf_counter()
         print("finding anomalies")
-
+        ENERGY_THRESHOLD = self._baseline.energy_threshold
+        print(f"Energy Threshold: {ENERGY_THRESHOLD:.4f}")
         all_energies = []
+        l_energies = []
+        g_energies = []
+        topk_features = []
         true_is_malicious = []
-        flow_ids = list(self._nodes.keys())
+        stat_grid = []
+        shannon = []
+        explanations_given = {str(label): [False, False] for label in test_identification["Label"].unique()}
+        flow_ids = [int(i) for i in self._nodes.keys()]
 
 
         c = 0
+        v = 0
         for id, node in self._nodes.items():
 
-            if c < 30:
-                self.explain_prediction(id)
-            elif c == 30:
-                print("-"*120)
-            c += 1
-            label = test_identification.at[id, "Label"]
+            label = str(test_identification.at[id, "Label"])
             is_malicious = label != "BENIGN"
+
+            global_energy, feature_energy, combined_energy = self.energy_parts(node)
+            topk = self.all_features(combined_energy)
             energy = self.combined_energy(node)
 
+            shannon.append(float(self.shannon_entropy(combined_energy)))
             all_energies.append(energy)
+            l_energies.append(float(feature_energy.sum()))
+            g_energies.append(float(global_energy.sum()))
+            topk_features.append(topk)
             true_is_malicious.append(is_malicious)
+
+
+            if (not explanations_given[label][0]) and (energy > ENERGY_THRESHOLD):
+                self.explain_prediction(id)
+                explanations_given[label][0] = True
+    
+            if (not explanations_given[label][1]) and (not (energy > ENERGY_THRESHOLD)):
+                self.explain_prediction(id)
+                explanations_given[label][1] = True
 
 
         all_energies = np.array(all_energies)
         true_is_malicious = np.array(true_is_malicious)
 
-        ENERGY_THRESHOLD = self._baseline.energy_threshold
-        print(f"Energy Threshold: {ENERGY_THRESHOLD:.4f}")
 
         predictions = all_energies > ENERGY_THRESHOLD
 
-        fp = int(( predictions & ~true_is_malicious).sum())
-        fn = int((~predictions & true_is_malicious).sum())
-        tp = int(( predictions & true_is_malicious).sum())
-        tn = int((~predictions & ~true_is_malicious).sum())
+        detect_time = time.perf_counter() - start
+        print(f"Find Anomalies time: {detect_time:.6f}")
 
-        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        attack_labels = test_identification.loc[[int(i) for i in flow_ids], "Label"].values
+        unique_labels = sorted(set(attack_labels))
 
+        print(f"\n{'Attack Type':<30} {'Total':>8} {'Detected':>9} {'Missed':>8} {'Recall/Spec':>12}")
+        print("-" * 65)
 
-        print(f"Total Incorrect: {fn + fp}")
-        print(f"Total Correct: {tn + tp}")
-        print(f"Total Nodes: {len(self._nodes.keys())}")
-        after_read = time.perf_counter()
-        print(f"Find anomalies time: {after_read-start:.6f}s")
+        for label in unique_labels:
+            mask = attack_labels == label
+            label_true = true_is_malicious[mask]
+            label_pred = predictions[mask]
+            total = mask.sum()
 
+            if label == "BENIGN":
+                tn_l = int((~label_pred & ~label_true).sum())
+                fp_l = int(( label_pred & ~label_true).sum())
+                specificity = tn_l / total if total > 0 else 0
+                stat_grid.append(["BENIGN", int(total), int(tn_l), int(fp_l), float(specificity)])
+                print(f"{'BENIGN (specificity)':<30} {total:>8,} {tn_l:>9,} {fp_l:>8,} {specificity:>12.3f}")
+            else:
+                tp_l = int(( label_pred &  label_true).sum())
+                fn_l = int((~label_pred &  label_true).sum())
+                recall = tp_l / total if total > 0 else 0
+                stat_grid.append([label, int(total), int(tp_l), int(fn_l), float(recall)])
+                print(f"{label:<30} {total:>8,} {tp_l:>9,} {fn_l:>8,} {recall:>12.3f}")
 
-        # bunch of statistic stuff to help debug
-        thresh_candidates = np.percentile(all_energies, np.linspace(0, 100, 1000))
-        f1s = [f1_score(true_is_malicious, all_energies > t) for t in thresh_candidates]
-        best_t = thresh_candidates[np.argmax(f1s)]
-        best_f1 = max(f1s)
-        print(f"F1-optimal threshold: {best_t:.4f}  F1={best_f1:.4f}  "
-              f"(Monday-derived threshold F1={f1_score(true_is_malicious, predictions):.4f})")
+        print("-" * 65)
+
+        total_flagged = predictions.sum()
+        total_malicious = true_is_malicious.sum()
+        global_tp = int(( predictions &  true_is_malicious).sum())
+        global_tn = int((~predictions & ~true_is_malicious).sum())
+        global_fp = int(( predictions & ~true_is_malicious).sum())
+        global_fn = int((~predictions &  true_is_malicious).sum())
+        tpr = global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else 0
+        fpr = global_fp / (global_fp + global_tn) if (global_fp + global_tn) > 0 else 0
+        global_precision = global_tp / total_flagged if total_flagged   > 0 else 0.0
+        global_recall = global_tp / total_malicious if total_malicious > 0 else 0.0
+        global_f1 = (2 * global_precision * global_recall / (global_precision + global_recall) if (global_precision + global_recall) > 0 else 0.0)
+        global_accuracy = (global_tp + global_tn) / len(predictions)
+        global_fpr = global_fp / (global_fp + global_tn) if (global_fp + global_tn) > 0 else 0.0
+
+        f2 = fbeta_score(true_is_malicious, predictions, beta=2)
+        f0_5 = fbeta_score(true_is_malicious, predictions, beta=0.5)
 
         fpr_curve, tpr_curve, _ = roc_curve(true_is_malicious, all_energies)
         roc_auc = auc(fpr_curve, tpr_curve)
 
-        self.plot(all_energies, true_is_malicious, ENERGY_THRESHOLD,
-                   fpr_curve, tpr_curve, roc_auc, fpr, tpr)
+        print(f"\n{'GLOBAL METRICS':}")
+        print(f"TP={global_tp:,}  FP={global_fp:,}  TN={global_tn:,}  FN={global_fn:,}")
+        print(f"Accuracy:   {global_accuracy:.4f}")
+        print(f"Precision:  {global_precision:.4f}")
+        print(f"Recall:     {global_recall:.4f}")
+        print(f"F1:         {global_f1:.4f}")
+        print(f"F2:         {f2:.4f}  (recall-weighted)")
+        print(f"F0.5:       {f0_5:.4f}  (precision-weighted)")
+        print(f"FPR:        {global_fpr:.4f}")
+        print(f"ROC AUC:    {roc_auc:.4f}")
+        print(f"TPR:        {global_recall:.4f}")
+        print("-" * 70)
 
-        print(f"TP={tp}  FP={fp}  TN={tn}  FN={fn}")
-        print(f"TPR={tpr:.3f}  FPR={fpr:.3f}")
-        print(f"ROC AUC = {roc_auc:.4f}")
-        print(f"find anomalies time: {time.perf_counter() - start:.6f}s")
+        label = f"all-full-{TIME_BIN_SIZE_S}"
+        snapshot = {
+                "label": label,
+                "tp": global_tp,
+                "fp": global_fp,
+                "tn": global_tn,
+                "fn": global_fn,
+                "accuracy": global_accuracy,
+                "precision": global_precision,
+                "recall": global_recall,
+                "f1": global_f1,
+                "f2": f2,
+                "f0.5": f0_5,
+                "fpr": global_fpr,
+                "tpr": global_recall,
+                "roc": roc_auc,
+                "stat_grid": stat_grid,
+                "topk_feautres": topk_features,
+                "energies": all_energies.tolist(),
+                "global_energies": g_energies,
+                "local_energies": l_energies,
+                "shannon": shannon,
+                "fids": flow_ids,
+                "true_is_malicious": true_is_malicious.tolist(),
+                "flow_labels": [test_identification.at[int(fid), "Label"] for fid in flow_ids],
+                "build_time": self.build_time,
+                "detection_time": detect_time,
+                }
 
-        fp_ids = [flow_ids[i] for i in range(len(flow_ids))
-                  if predictions[i] and not true_is_malicious[i]]
+        filepath = f"./saves/timed-all/{label}"
+        with open(filepath, "w") as f:
+            json.dump(snapshot, f)
 
-        fp_energies = all_energies[[i for i in range(len(flow_ids))
-                                     if predictions[i] and not true_is_malicious[i]]]
+    def plot_energy_change(self):
+        fid: FlowId = np.int32(19)
+        peer_fids = list(self._edges[fid])
+        energies = []
+        node = self._nodes[fid]
+        node.degree = 0
+        node.mean_fv = np.zeros(len(node.fv), dtype=np.float64)
+        node.peer_var = np.zeros(len(node.fv))
+        node.m2 = np.zeros(len(node.fv))
 
-        fp_dsts = pd.Series([graph._nodes[id].dst for id in fp_ids])
-        print("FP flows by dst IP:")
-        print(fp_dsts.value_counts().head(10))
+        for peer in peer_fids:
+            node.mean_fv, node.m2, node.degree, node.peer_var = update_running_variance_batch(node.mean_fv, node.m2, node.degree, np.array([self._nodes[peer].fv]))
+            energies.append(self.combined_energy(node))
 
-        fp_dst_in_baseline = [graph._nodes[id].dst in baseline.dst_mean for id in fp_ids]
-        print(f"\nFP flows whose destination was in monday baseline: {sum(fp_dst_in_baseline)}")
-        print(f"FP flows whose destination was not in monday baseline: {sum(not x for x in fp_dst_in_baseline)}")
 
-        print(f"\nFP energy stats:")
-        print(f"  min:    {fp_energies.min():.1f}")
-        print(f"  median: {np.median(fp_energies):.1f}")
-        print(f"  max:    {fp_energies.max():.1f}")
+        peers = list(range(1, len(energies) + 1))
 
-        top_ip_to_check = str(fp_dsts.value_counts().idxmax())
+        plt.figure()
+        plt.plot(peers, energies)
 
-        fp_ids_by_dst = [flow_ids[i] for i in range(len(flow_ids))
-                         if not true_is_malicious[i] 
-                         and predictions[i]
-                         and graph._nodes[flow_ids[i]].dst == top_ip_to_check]
+        plt.xlabel("Number of Peers")
+        plt.ylabel("Energy")
+        plt.title("Energy Convergence as More Peers are Added")
 
-        if fp_ids_by_dst:
-            fp_fvs = np.array([graph._nodes[id].fv for id in fp_ids_by_dst])
-            dst_mean = baseline.dst_mean[top_ip_to_check]
-            dst_var = baseline.dst_var[top_ip_to_check]
+        plt.ylim(0, 100)
 
-            residuals = fp_fvs - dst_mean
-            per_feature_energy = (residuals**2 / dst_var).mean(axis=0)
-            top_features = np.argsort(per_feature_energy)[::-1][:10]
-
-            feature_names = list(test_data.columns)
-            print(f"top energy-contributing features for {top_ip_to_check} FPs:")
-            for idx in top_features:
-                print(f"  {feature_names[idx]}: mean_contribution={per_feature_energy[idx]:.1f} fp_mean={fp_fvs[:,idx].mean():.4f}  baseline_mean={dst_mean[idx]:.4f}")
-
-            dst_port_idx = feature_idx_map["Dst Port"]
-
-            fp_ports = [
-                int(round(graph._nodes[flow_ids[i]].fv[dst_port_idx] * denom["Dst Port"] + mins["Dst Port"]))
-                for i in range(len(flow_ids))
-                if predictions[i] and not true_is_malicious[i]
-            ]
-
-            fn_ports = [
-                int(round(graph._nodes[flow_ids[i]].fv[dst_port_idx] * denom["Dst Port"] + mins["Dst Port"]))
-                for i in range(len(flow_ids))
-                if not predictions[i] and true_is_malicious[i]
-            ]
-
-            print("\nTop 5 FP ports")
-            print(pd.Series(fp_ports).value_counts().head(5))
-            print("\nTop 5 FN ports")
-            print(pd.Series(fn_ports).value_counts().head(5))
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("energy_convergance.png")
+        plt.close()
 
     def plot(self, all_energies, true_is_malicious, threshold, fpr_curve, tpr_curve, roc_auc, fpr_op, tpr_op):
         benign_energy = all_energies[~true_is_malicious]
@@ -534,108 +694,37 @@ class FlowGraph:
         plt.close()
         print("saved diagram")
 
+    def topk_features(self, feature_energy: np.ndarray):
+        sorted_desc = np.argsort(feature_energy)[::-1]
+        total = np.sum(feature_energy)
+        return [[int(i), float(feature_energy[i])] for i in sorted_desc[:TOPK]]
+
+    def all_features(self, feature_energy: np.ndarray):
+        sorted_desc = np.argsort(feature_energy)[::-1]
+        return [[int(i), float(feature_energy[i])] for i in sorted_desc if feature_energy[i] > 1]
 
 
+    def shannon_entropy(self, x, eps=1e-12):
 
-class IpNode:
-    def __init__(self, ip: str):
-        self._ip: str = ip
-        self._degree: int = 0
-        self._mean_fv: np.ndarray = np.zeros(len(ALL_IP_FEATURES), dtype=np.float64)
+        total = np.sum(x)
+        if total == 0:
+            return 0.0
 
-    def update_fv(self, x: np.ndarray):
-        self._degree += 1
-        self._mean_fv += (x - self._mean_fv) / self._degree
+        p = x / total
+        p = p[p > 0]  # avoid log(0)
 
-    def structure(self):
-        print(f"\nIP: {self._ip}")
-        display_ip_io_fv(self._mean_fv) 
+        return -np.sum(p * np.log(p + eps))
 
 
-    def mean_feature_vector(self):
-        return self._mean_fv
-
-class IpGraph:
-    def __init__(self):
-        self.ip_map: dict[str, int] = {}
-        self._nodes: list[IpNode] = []
-        self._edges: list[set[int]] = []
-
-    def swap_io_features(self, features: np.ndarray) -> np.ndarray:
-        OUT = slice(len(IO_FEATURES), len(IO_FEATURES) + len(OUT_FEATURES))
-        IN = slice(len(IO_FEATURES) + len(OUT_FEATURES), len(ALL_IP_FEATURES))
-        swapped = features.copy()
-        swapped[OUT], swapped[IN] = swapped[IN].copy(), swapped[OUT].copy()
-        return swapped
-
-    def get_id_from_ip(self, ip: str) -> int:
-        if ip not in self.ip_map:
-            id = len(self._nodes)
-            self._nodes.append(IpNode(ip))
-            self._edges.append(set())
-            self.ip_map[ip] = id
-        return self.ip_map[ip]
-
-    def add_edge(self, src: str, dst: str, features: np.ndarray):
-        src_id = self.get_id_from_ip(src)
-        dst_id = self.get_id_from_ip(dst)
-        self._edges[src_id].add(dst_id)
-        self._edges[dst_id].add(src_id)
-        self._nodes[src_id].update_fv(features)
-        inverted_features = self.swap_io_features(features)
-        #print("" + "".join(f"{v:<{20}}" for v in np.round(features, 3)))
-        #print("" + "".join(f"{v:<{20}}" for v in np.round(inverted_features, 3)))
-        self._nodes[dst_id].update_fv(inverted_features)
-
-    def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
-        features = data[ALL_IP_FEATURES].to_numpy(dtype=np.float64)
-        flow_ips = ids[["Src IP", "Dst IP"]].to_numpy()
-        start = time.perf_counter()
-        for i in range(len(features)):
-            #print(f"src: {flow_ips[i, 0]}, dst: {flow_ips[i, 1]}")
-            self.add_edge(flow_ips[i, 0], flow_ips[i, 1], features[i])
-        end = time.perf_counter()
-        print(f"Graph built in {end-start:.6f}s")
-
-    def structure(self):
-        print("Nodes: ", len(self._nodes))
-        edges = sum([len(edge) for edge in self._edges])
-        print("Edges: ", edges/2)
-
-    def get_neighbours_by_ip(self, ip: str) -> set[int]:
-        id = self.ip_map[ip]
-        return self._edges[id]
-
-    def get_neighbours_by_id(self, id: int) -> set[int]:
-        if id > len(self._nodes)-1:
-            raise ValueError("id does not exist")
-        return self._edges[id]
-
-    def structure_of(self, id: int):
-        if id > len(self._nodes)-1:
-            raise ValueError("id does not exist")
-        self._nodes[id].structure()
-
-# residual = observed - predicted
-    def find_anomalies(self):
-        for id in self.ip_map.values():
-            if id > 10:
-                break
-            mean_neighbour_features: np.ndarray = np.zeros(len(ALL_IP_FEATURES), dtype=np.float64)
-            node = self._nodes[id]
-            edges = self._edges[id]
-            for (edge, count) in enumerate(edges, start=1):
-                mean_neighbour_features += (self._nodes[edge].mean_feature_vector() - mean_neighbour_features) / count
-
-            print("\n\nNEIGHBOURS")
-            display_ip_io_fv(mean_neighbour_features)
-            residual = node.mean_feature_vector() - mean_neighbour_features
-            print("RESIDUAL")
-            display_ip_io_fv(residual)
-
-
-
-
+dataset_folder = "./dataset"
+dataset_files = Path(dataset_folder).rglob("*.csv") 
+print(dataset_files)
+start = time.perf_counter()
+data = pd.concat((pd.read_csv(file) for file in dataset_files if file.name != "monday.csv"), ignore_index=True)
+data["id"] = data.index
+df_monday = pd.read_csv(f"{dataset_folder}/monday.csv")
+after_read = time.perf_counter()
+print(f"Dataset read time: {after_read-start:.6f}s")
 
 benign_data, benign_identification, mins, denom = process_benign_data(df_monday)
 common_cols = benign_data.columns
@@ -644,32 +733,17 @@ test_data = test_data.reindex(columns=common_cols, fill_value=0.0)
 
 print("\nscaled test feature maximums:")
 print(test_data.abs().max().sort_values(ascending=False).head(25))
-
 feature_idx_map = {}
 for (idx, feature_name) in enumerate(test_data.columns.values):
     feature_idx_map[feature_name] = idx
 timestart = to_microseconds(test_identification["Timestamp"].iloc[0])
 
-graph: FlowGraph;
-baseline: BaselineGraph;
 
-load_from_file = False
-if load_from_file:
-    file = open("graph.bin", "rb")
-    graph = pickle.load(file)
-    file.close()
-    graph.structure()
-else:
-    baseline = BaselineGraph(feature_len=len(benign_data.columns))
-    baseline.initialize_from_df(benign_data, benign_identification)
+baseline = BaselineGraph(feature_len=len(benign_data.columns))
+baseline.initialize_from_df(benign_data, benign_identification)
 
-    graph = FlowGraph(feature_len=len(benign_data.columns), timestart=timestart, baseline=baseline)
-    graph.initialize(test_data, test_identification)
-    #pickle.dump(graph, open("graph.bin", "wb"), protocol=pickle.HIGHEST_PROTOCOL)
+graph = FlowGraph(feature_len=len(benign_data.columns), timestart=timestart, baseline=baseline)
+graph.initialize(test_data, test_identification)
 
 
-check = 362075
-#print(f"edges: {len(graph._edges[check])}")
-#graph.compare(check, graph._edges[check].pop())
-#graph._nodes[check].structure()
 graph.find_anomalies(test_identification)
