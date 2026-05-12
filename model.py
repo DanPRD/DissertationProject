@@ -6,14 +6,10 @@ import numpy as np
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from sklearn.metrics import roc_curve, auc, f1_score, fbeta_score
+from sklearn.metrics import roc_curve, auc, fbeta_score
 pd.set_option("display.max_rows", None)
 pd.set_option("display.float_format", "{:.6f}".format)
 
-IO_FEATURES = ["Flow Packets/s", "Flow Bytes/s", "Average Packet Size"]
-OUT_FEATURES = ["Total Fwd Packet", "Fwd Packets/s"]  # "Dst Port",
-IN_FEATURES = ["Total Bwd packets", "Bwd Packets/s"]  # "Src Port",
-ALL_IP_FEATURES = IO_FEATURES + OUT_FEATURES + IN_FEATURES
 
 TIME_BIN_SIZE_S = 180
 TIME_BIN_SIZE = TIME_BIN_SIZE_S * 1000000
@@ -31,9 +27,7 @@ type FlowId = np.int32
 # maybe remove source/dst port since it doesnt give that much info, and more often than not gives energy which isnt relevant, since nodes often use many different ports, same with protocol
 def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     df = df.dropna()
-    #df = df.drop(columns=[c for c in df.columns if df[c].nunique() == 1])
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
-    #df.loc[df["Attempted Category"] != -1, "Label"] = "BENIGN"
 
     split_cols = ["id", "Flow ID", "Attempted Category", "Label", "Src IP", "Dst IP", "Timestamp", "Protocol"]
 
@@ -44,7 +38,7 @@ def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
 
     mins = df.min() 
     denom = (df.max() - mins).replace(0, 1)
-    df = (df - mins) / denom # original = scaled * denom + mins 
+    df = (df - mins) / denom
     return (df, identification_data, mins, denom)
 
 
@@ -65,17 +59,7 @@ def process_test_data(df: pd.DataFrame, mins: pd.Series, denom: pd.Series) -> tu
 
 
     df = (df - mins) / denom
-    #df = df.clip(lower=-FEATURE_CLIP_MAX, upper=FEATURE_CLIP_MAX)  
     return (df, identification_data)
-
-
-
-def display_ip_io_fv(fv: np.ndarray):
-    width = 20
-    print("".join(f"{h:<{width}}" for h in ALL_IP_FEATURES))
-    print("".join(f"{v:<{width}.3f}" for v in np.round(fv, 3)))
-
-
 
 def to_microseconds(timestamp: str) -> int:
     return (
@@ -85,8 +69,6 @@ def to_microseconds(timestamp: str) -> int:
         int(timestamp[17:19]) * 1000000 +  # seconds
         int(timestamp[20:26])    # microseconds
     )
-
-
 
 def update_running_variance_batch(old_mean, old_M2, old_n, new_values):
     new_n = len(new_values)
@@ -115,31 +97,21 @@ class FlowNode:
         self.dst: str = dst
         self.fv: np.ndarray = fv
         self.degree: int = 0
-        self.real_degree: int = 0
         self.m2: np.ndarray = np.zeros(len(fv))
         self.mean_fv: np.ndarray = np.zeros(len(fv), dtype=np.float64)
         self.peer_var: np.ndarray = np.zeros(len(fv))
 
-
     def update_fv(self, x: np.ndarray):
         self.degree += 1
         self.mean_fv += (x - self.mean_fv) / self.degree
-
-    def structure(self):
-        print(f"Src: {self.src}")
-        print(f"Dst: {self.dst}")
-        for (header, feature, mean_feature) in zip(feature_idx_map, self.fv, self.mean_fv):
-            print(f"{header}: {feature} ; {mean_feature}")
 
 
 class BaselineGraph:
     def __init__(self, feature_len: int):
         self._feature_len = feature_len
         self._dst_fvs: defaultdict[str, list[np.ndarray]] = defaultdict(list)
-        #self._src_fvs: defaultdict[str, list[np.ndarray]] = defaultdict(list)
         self.dst_mean: dict[str, np.ndarray] = {}
         self.dst_var: dict[str, np.ndarray] = {}
-        #self.src_mean: dict[str, np.ndarray] = {}
         self.global_mean: np.ndarray = np.zeros(feature_len)
         self.global_var: np.ndarray = np.ones(feature_len)
         self.energy_threshold: float = 0.0
@@ -149,7 +121,6 @@ class BaselineGraph:
 
     def add_flow(self, src: str, dst: str, protocol: int, features: np.ndarray):
         self._dst_fvs[dst].append(features)
-        #self._src_fvs[src].append(features)
 
     def build(self, threshold_percentile: float = 99.5):
         start = time.perf_counter()
@@ -221,24 +192,13 @@ class FlowGraph:
         self._feature_len: int = feature_len
         self._nodes: dict[FlowId, FlowNode] = {}
         self._edges: defaultdict[FlowId, set[FlowId]] = defaultdict(set)
-        self._src_grp: defaultdict[str, set[FlowId]] = defaultdict(set)
-        self._dst_grp: defaultdict[str, set[FlowId]] = defaultdict(set)
-        self._fullmatch_grp: defaultdict[tuple[str, str, int, float], set[int]] = defaultdict(set)
         self._timestart = timestart
         self._baseline = baseline
         self.build_time = 0
-        self.detect_time = 0
-
 
     def insert_flow(self, flow_id: FlowId, src: str, dst: str, timestamp: str, dstp: int, features: np.ndarray, ):
         if flow_id not in self._nodes:
             self._nodes[flow_id] = FlowNode(flow_id, features, src, dst, dstp)
-            #self._src_grp[src].add(flow_id)
-            #self._dst_grp[dst].add(flow_id)
-            #time_bin = (to_microseconds(timestamp) - self._timestart) // TIME_BIN_SIZE
-            #self._fullmatch_grp[(src, dst, int(features[feature_idx_map["Protocol"]]), time_bin)].add(flow_id)
-
-
 
     def find_edges(self):
         flow_id_list = list(self._nodes.keys())
@@ -276,28 +236,18 @@ class FlowGraph:
                     new_peers = [j for j in benign_idxs if j != i and flow_id_list[j] not in self._edges[fid]]
                     if not new_peers:
                         continue
-                    #new_peers_mean = fvs[new_peers].mean(axis=0)
-                    #new_peers_var = fvs[new_peers].var(axis=0)
-                    #n_new = len(new_peers)
-                    #total = node.degree + n_new
+
                     node.mean_fv, node.m2, node.degree, node.peer_var = update_running_variance_batch(
                         node.mean_fv,
                         node.m2,
                         node.degree,
                         fvs[new_peers]
                     )
-                    #self._edges[fid].update([flow_id_list[j] for j in new_peers])
-                    #node.mean_fv   = (node.mean_fv * node.degree + new_peers_mean * n_new) / total
-                    #node.peer_var = (node.peer_var * node.degree + new_peers_var * n_new) / total
-                    #node.degree    = total
-                    node.real_degree += len(flowids_in_cluster) - 1
 
             print(f"\n{cluster_name}: {total_clusters:,} / {total_clusters:,} groups done")
 
-        #apply_group("Layer1 (src+dst)", lambda i: (srcs[i], dsts[i]))
         apply_group("Layer2 (dst)",     lambda i: (self._nodes[i].dst, (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
         apply_group("Layer3 (dstport)", lambda i: (self._nodes[i].fv[feature_idx_map["Dst Port"]], (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
-
 
     def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
         start = time.perf_counter()
@@ -305,8 +255,6 @@ class FlowGraph:
         flow_data = ids[["id", "Src IP", "Dst IP", "Timestamp", "Protocol"]].to_numpy()
         for i in range(len(features)):
             self.insert_flow(np.int32(flow_data[i, 0]), flow_data[i, 1], flow_data[i, 2], flow_data[i, 3], flow_data[i, 4], features[i])
-
-
 
         print(f"Finding Edges")
         self.find_edges()
@@ -341,60 +289,6 @@ class FlowGraph:
         combined = ((1 - ALPHA) * global_per_feature) + (ALPHA * local_per_feature)
         return global_per_feature, local_per_feature, combined
 
-    def structure(self):
-        print("Nodes: ", len(self._nodes))
-        edges = sum([len(edge) for edge in self._edges.values()])
-        print("Edges: ", edges/2)
-        maxn = 0
-        minn = 99999999
-        for l in self._fullmatch_grp.values():
-            maxn = max(maxn, len(l))
-            minn = min(minn, len(l))
-        print(f"dst:{len(self._dst_grp)}\nsrc:{len(self._src_grp)}\nfull:{len(self._fullmatch_grp)} max:{maxn} min:{minn}")
-        edge_counts = [len(self._edges[id]) for id in self._nodes]
-        print(f"Nodes with 0 edges: {sum(1 for e in edge_counts if e == 0)}")
-        print(f"Nodes with 1-3 edges: {sum(1 for e in edge_counts if 1 <= e <= 3)}")
-        print(f"Median edges per node: {np.median(edge_counts)}")
-        print(f"Mean edges per node: {np.mean(edge_counts):.2f}")
-
-        # Diagnose WHO the zero-edge nodes are
-        zero_edge_ids = [id for id in self._nodes if len(self._edges[id]) == 0]
-
-        labels = test_identification.loc[[int(i) for i in zero_edge_ids], "Label"]
-        print(f"Zero-edge nodes that are BENIGN: {(labels == 'BENIGN').sum()}")
-        print(f"Zero-edge nodes that are MALICIOUS: {(labels != 'BENIGN').sum()}")
-
-        zero_srcs = [self._nodes[id].src for id in zero_edge_ids]
-        print(f"Unique src IPs in zero-edge nodes: {len(set(zero_srcs))}")
-        print(f"Most common src IPs: {pd.Series(zero_srcs).value_counts().head(10)}")
-
-        edge_counts = pd.Series({id: len(self._edges[id]) for id in self._nodes})
-        mal_ids = test_identification[test_identification["Label"] != "BENIGN"].index
-        ben_ids = test_identification[test_identification["Label"] == "BENIGN"].index
-
-        print(f"\nBenign edge count stats:")
-        print(edge_counts[edge_counts.index.isin(ben_ids)].describe())
-        print(f"\nMalicious edge count stats:")
-        print(edge_counts[edge_counts.index.isin(mal_ids)].describe())
-
-    def get_neighbours_by_id(self, id: FlowId) -> set[int]:
-        if id > len(self._nodes)-1:
-            raise ValueError("id does not exist")
-        return self._edges[id]
-
-    def structure_of(self, id: FlowId):
-        if id not in self._nodes:
-            raise ValueError("id does not exist")
-        print(f"FLOW ID {id}--------------------")
-        print(f"Edges ({self._nodes[id].degree}): {self._edges[id]}")
-        self._nodes[id].structure()
-
-    def compare(self, lhs_id, rhs_id):
-        print(f"COMPARISON----------------------")
-        for (header, lhs, rhs) in zip(feature_idx_map, self._nodes[lhs_id].fv, self._nodes[rhs_id].fv):
-            print(f"{header}: {lhs} - {rhs}")
-
-
     def explain_prediction(self, flow_id):
         print("\n\n" + "-"*120)
         denom_n = denom.to_numpy()
@@ -413,7 +307,6 @@ class FlowGraph:
         sorted_perf_energy = np.argsort(combined)[::-1]
         prediction = energy > self._baseline.energy_threshold
         label = test_identification.at[flow_id, "Label"]
-        is_malicious = label != "BENIGN"
         shannon = self.shannon_entropy(combined)
         rows = [{
             "FEATURE": feature_names[idx],
@@ -466,10 +359,6 @@ class FlowGraph:
         print(f"Shannon: {shannon}")
         print(f"Flow Timestamp: {test_identification.at[flow_id, "Timestamp"]}") 
 
-
-
-
-
     def find_anomalies(self, test_identification: pd.DataFrame):
         start = time.perf_counter()
         print("finding anomalies")
@@ -485,9 +374,6 @@ class FlowGraph:
         explanations_given = {str(label): [False, False] for label in test_identification["Label"].unique()}
         flow_ids = [int(i) for i in self._nodes.keys()]
 
-
-        c = 0
-        v = 0
         for id, node in self._nodes.items():
 
             label = str(test_identification.at[id, "Label"])
@@ -616,84 +502,6 @@ class FlowGraph:
         with open(filepath, "w") as f:
             json.dump(snapshot, f)
 
-    def plot_energy_change(self):
-        fid: FlowId = np.int32(19)
-        peer_fids = list(self._edges[fid])
-        energies = []
-        node = self._nodes[fid]
-        node.degree = 0
-        node.mean_fv = np.zeros(len(node.fv), dtype=np.float64)
-        node.peer_var = np.zeros(len(node.fv))
-        node.m2 = np.zeros(len(node.fv))
-
-        for peer in peer_fids:
-            node.mean_fv, node.m2, node.degree, node.peer_var = update_running_variance_batch(node.mean_fv, node.m2, node.degree, np.array([self._nodes[peer].fv]))
-            energies.append(self.combined_energy(node))
-
-
-        peers = list(range(1, len(energies) + 1))
-
-        plt.figure()
-        plt.plot(peers, energies)
-
-        plt.xlabel("Number of Peers")
-        plt.ylabel("Energy")
-        plt.title("Energy Convergence as More Peers are Added")
-
-        plt.ylim(0, 100)
-
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig("energy_convergance.png")
-        plt.close()
-
-    def plot(self, all_energies, true_is_malicious, threshold, fpr_curve, tpr_curve, roc_auc, fpr_op, tpr_op):
-        benign_energy = all_energies[~true_is_malicious]
-        malicious_energy = all_energies[true_is_malicious]
-
-        fig = plt.figure(figsize=(16, 12))
-        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
-
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.hist(benign_energy, bins=100, alpha=0.6, color="blue", label=f"benign (n={len(benign_energy)})")
-        ax1.hist(malicious_energy, bins=100, alpha=0.6, color="red", label=f"malicious (n={len(malicious_energy)})")
-        ax1.axvline(threshold, color="black", linestyle="--", label=f"threshold = {threshold:.2f}")
-        ax1.set_xscale("log")
-        ax1.set_yscale("log")
-        ax1.set_xlabel("energy")
-        ax1.set_ylabel("count")
-        ax1.set_title("energy distribution (log-log)"); ax1.legend()
-
-        ax2 = fig.add_subplot(gs[0, 1])
-        for e, c, lbl in [(benign_energy, "blue", "benign"), (malicious_energy, "red", "malicious")]:
-            s = np.sort(e)
-            ax2.plot(s, np.arange(1, len(s)+1)/len(s), color=c, label=lbl)
-
-        ax2.axvline(threshold, color="black", linestyle="--")
-        ax2.set_xscale("log"); ax2.set_xlabel("Energy")
-        ax2.set_ylabel("cumulative proportion")
-        ax2.set_title("ECDF"); ax2.legend()
-
-        ax3 = fig.add_subplot(gs[1, 0])
-        ax3.violinplot([np.log10(benign_energy + 1e-12), np.log10(malicious_energy + 1e-12)], positions=[1, 2], showmedians=True)
-        ax3.set_xticks([1, 2]); ax3.set_xticklabels(["benign", "malicious"])
-        ax3.axhline(np.log10(threshold), color="black", linestyle="--", label=f"threshold = {threshold:.2f}")
-        ax3.set_ylabel("log₁₀(energy)"); ax3.set_title("violin"); ax3.legend()
-
-        ax4 = fig.add_subplot(gs[1, 1])
-        ax4.plot(fpr_curve, tpr_curve, color="darkorange", label=f"ROC AUC={roc_auc:.3f}")
-        ax4.plot([0,1],[0,1], "navy", linestyle="--")
-        ax4.scatter([fpr_op], [tpr_op], color="red", zorder=5, label=f"monday threshold\n(TPR={tpr_op:.2f}, FPR={fpr_op:.2f})")
-        ax4.set_xlabel("FPR")
-        ax4.set_ylabel("TPR")
-        ax4.set_title("ROC Curve")
-        ax4.legend()
-
-        fig.suptitle("residual energy visualisation", fontsize=14, fontweight="bold")
-        plt.savefig("energy_analysis.png", dpi=300)
-        plt.close()
-        print("saved diagram")
-
     def topk_features(self, feature_energy: np.ndarray):
         sorted_desc = np.argsort(feature_energy)[::-1]
         total = np.sum(feature_energy)
@@ -703,9 +511,7 @@ class FlowGraph:
         sorted_desc = np.argsort(feature_energy)[::-1]
         return [[int(i), float(feature_energy[i])] for i in sorted_desc if feature_energy[i] > 1]
 
-
     def shannon_entropy(self, x, eps=1e-12):
-
         total = np.sum(x)
         if total == 0:
             return 0.0
