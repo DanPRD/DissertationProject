@@ -9,21 +9,25 @@ from sklearn.metrics import roc_curve, auc, fbeta_score
 pd.set_option("display.max_rows", None)
 pd.set_option("display.float_format", "{:.6f}".format)
 
-
-TIME_BIN_SIZE_S = 180
+# hyperparameters for the model
+TIME_BIN_SIZE_S = 180 # delta t
 TIME_BIN_SIZE = TIME_BIN_SIZE_S * 1000000
-ALPHA = 1 # weight of local signal 0 = global only 1 = local only
+ALPHA = 1 # weight of local signal 0 = global only 1 = local only, using 1 for model only and should not be changed
 MIN_EDGES = 3
-ENERGY_THRESHOLD_SCALAR = 1.4
-VERBOSE = True
+ENERGY_THRESHOLD_SCALAR = 1.4 # k
+VAR_MINIMUM = 0.01 # v
+
+# parameters for output and saving snapshots of model
+VERBOSE = False
 FEATURES_TO_DISPLAY = 5
-VAR_MINIMUM = 0.01
 TOPK = 5
 protocol_map = {6: "TCP", 17: "UDP", 1: "ICMP"}
+
 type FlowId = np.int32
 
-# 'Packet Length Mean' and 'Average Packet Size' seem to just be the same value with very minor changes, like 0.01 difference
-# maybe remove source/dst port since it doesnt give that much info, and more often than not gives energy which isnt relevant, since nodes often use many different ports, same with protocol
+
+
+# normalize the benign day data (monday) using min-max scaling, and return seperated identification and data features
 def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     df = df.dropna()
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
@@ -41,7 +45,7 @@ def process_benign_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     return (df, identification_data, mins, denom)
 
 
-# for ATTACK DATA
+# for same as before but for attack data, using the benign min-max constants
 def process_test_data(df: pd.DataFrame, mins: pd.Series, denom: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.dropna()
     df = df.replace([np.inf, -np.inf], np.nan).dropna()
@@ -60,6 +64,7 @@ def process_test_data(df: pd.DataFrame, mins: pd.Series, denom: pd.Series) -> tu
     df = (df - mins) / denom
     return (df, identification_data)
 
+# timestamp to microseconds
 def to_microseconds(timestamp: str) -> int:
     return (
         int(timestamp[8:10]) * 1000000 * 60 * 60 * 24 + # day
@@ -69,6 +74,7 @@ def to_microseconds(timestamp: str) -> int:
         int(timestamp[20:26])    # microseconds
     )
 
+# welfords running online algorithm for mean and variance
 def update_running_variance_batch(old_mean, old_M2, old_n, new_values):
     new_n = len(new_values)
     total_n = old_n + new_n
@@ -88,23 +94,25 @@ def update_running_variance_batch(old_mean, old_M2, old_n, new_values):
 
     return new_mean, new_M2, total_n, new_variance
 
+
+# node corresponding to each flow in the graph
 class FlowNode:
     def __init__(self, flow_id: FlowId, fv: np.ndarray, src: str, dst: str, dstp: int):
         self.dstp = dstp
         self.flow_id: FlowId = flow_id
         self.src: str = src
         self.dst: str = dst
-        self.fv: np.ndarray = fv
+        self.fv: np.ndarray = fv # node feature vector
         self.degree: int = 0
         self.m2: np.ndarray = np.zeros(len(fv))
-        self.mean_fv: np.ndarray = np.zeros(len(fv), dtype=np.float64)
-        self.peer_var: np.ndarray = np.zeros(len(fv))
+        self.mean_fv: np.ndarray = np.zeros(len(fv), dtype=np.float64) # mean fv of peers (connected flow nodes)
+        self.peer_var: np.ndarray = np.zeros(len(fv)) # variance of peers
 
     def update_fv(self, x: np.ndarray):
         self.degree += 1
         self.mean_fv += (x - self.mean_fv) / self.degree
 
-
+# baseline statistic creation
 class BaselineGraph:
     def __init__(self, feature_len: int):
         self._feature_len = feature_len
@@ -121,6 +129,7 @@ class BaselineGraph:
     def add_flow(self, src: str, dst: str, protocol: int, features: np.ndarray):
         self._dst_fvs[dst].append(features)
 
+    # build baseline using all of monday flows
     def build(self, threshold_percentile: float = 99.5):
         start = time.perf_counter()
         all_fvs = np.vstack(list(self._dst_fvs.values()))
@@ -149,13 +158,15 @@ class BaselineGraph:
         mu = log_energies.mean()
         std = log_energies.std()
  
+        # calculate energy threshold using mean, variance and threshold
         self.energy_threshold = 10 ** (mu + ENERGY_THRESHOLD_SCALAR * std)
         end = time.perf_counter()
         print(f"baseline built: {len(all_fvs)} flows, {len(self.dst_mean)} unique dsts")
-        print(f"baseline built in: {start-end:.6f}")
+        print(f"baseline built in: {end-start:.6f}")
         print(f"monday log-energy: mu={mu:.2f}, std={std:.2f}")
         print(f"energy threshold (mu+{ENERGY_THRESHOLD_SCALAR}σ): {self.energy_threshold:.2f}")
 
+    # returns the global energy constant, used by attack flows not present in baseline
     def global_energy(self, fv: np.ndarray, dst: str, protocol: int) -> float:
         mean = self.dst_mean.get(dst, self.global_mean)
         var = self.dst_var.get(dst, self.global_var)
@@ -165,6 +176,7 @@ class BaselineGraph:
 
         return float(np.sum((fv - mean) ** 2 / var_floored))
 
+    # returns the energy for each feature seperately
     def perf_energy(self, fv: np.ndarray, dst: str, protocol: int) -> np.ndarray:
         mean = self.dst_mean.get(dst, self.global_mean)
         var = self.dst_var.get(dst, self.global_var)
@@ -178,6 +190,7 @@ class BaselineGraph:
     def get_baselines(self, dst: str, protocol: int) -> tuple[np.ndarray, np.ndarray]:
         return (self.dst_mean.get(dst, self.global_mean), np.maximum(self.dst_var.get(dst, self.global_var), self.global_var * VAR_MINIMUM))
 
+    # load flows
     def initialize_from_df(self, data: pd.DataFrame, ids: pd.DataFrame):
         features = data.to_numpy(dtype=np.float64)
         flow_data = ids[["Src IP", "Dst IP", "Protocol"]].to_numpy()
@@ -185,7 +198,7 @@ class BaselineGraph:
             self.add_flow(flow_data[i, 0], flow_data[i, 1], flow_data[i, 2], features[i])
         self.build()
 
-
+# flow graph for anomaly detection
 class FlowGraph:
     def __init__(self, feature_len: int, timestart: int, baseline: BaselineGraph):
         self._feature_len: int = feature_len
@@ -199,11 +212,13 @@ class FlowGraph:
         if flow_id not in self._nodes:
             self._nodes[flow_id] = FlowNode(flow_id, features, src, dst, dstp)
 
+    # find edges (peers) of flows using key indexing, and update running mean and variances
     def find_edges(self):
         flow_id_list = list(self._nodes.keys())
         fid_to_idx = {fid:i for i, fid in enumerate(flow_id_list)}
         fvs          = np.array([self._nodes[i].fv for i in flow_id_list])
-
+    
+        # get baseline energies
         energies = np.array([
             self._baseline.global_energy(self._nodes[i].fv, self._nodes[i].dst, 0)
             for i in flow_id_list
@@ -211,24 +226,23 @@ class FlowGraph:
         is_benign = energies < self._baseline.energy_threshold
         print(f"Benign candidates: {is_benign.sum():,} / {len(flow_id_list):,}")
 
+        # appy means, variances
         def apply_group(cluster_name: str, key_fn):
+            print(f"applying {cluster_name}")
             clusters: defaultdict[int, list[FlowId]] = defaultdict(list)
             for idx in flow_id_list:
                 clusters[key_fn(idx)].append(idx)
 
             total_clusters = len(clusters)
-            #print(f"\n{cluster_name}: {total_clusters:,} groups")
 
             for cluster_num, (cluster_key, flowids_in_cluster) in enumerate(clusters.items(), 1):
-                #if cluster_num % 2500 == 0:
-                    #print(f"\033[1G\033[2K{cluster_num}", end="", flush=True)
-                #print(f"\033[1G\033[2K{cluster_num} ({len(flowids_in_cluster)} flows): {cluster_num:,} / {total_clusters:,} groups processed", end="", flush=True)
-                #print( "", end="", flush=True )
 
+                # find the benign candidates for the flow
                 benign_idxs = [fid_to_idx[fid] for fid in flowids_in_cluster if is_benign[fid_to_idx[fid]]]
                 if not benign_idxs:
                     continue
 
+                # add peers to flow
                 for fid in flowids_in_cluster:
                     i = fid_to_idx[fid]
                     node = self._nodes[fid]
@@ -245,9 +259,10 @@ class FlowGraph:
 
             print(f"\n{cluster_name}: {total_clusters:,} / {total_clusters:,} groups done")
 
-        apply_group("Layer2 (dst)",     lambda i: (self._nodes[i].dst, (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
-        apply_group("Layer3 (dstport)", lambda i: (self._nodes[i].fv[feature_idx_map["Dst Port"]], (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
+        apply_group("Layer 1 (dstip)",     lambda i: (self._nodes[i].dst, (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
+        apply_group("Layer 2 (dstport)", lambda i: (self._nodes[i].fv[feature_idx_map["Dst Port"]], (to_microseconds(str(test_identification.at[i, "Timestamp"])) - self._timestart) // TIME_BIN_SIZE))
 
+    # entry point, adds flows to list  and created graph
     def initialize(self, data: pd.DataFrame, ids: pd.DataFrame):
         start = time.perf_counter()
         features = data.to_numpy(dtype=np.float64)
@@ -261,6 +276,7 @@ class FlowGraph:
         print(f"Graph and edges built in {end-start:.6f}s")
         self.build_time = end-start
 
+    # returns energy for specific node
     def combined_energy(self, node: FlowNode) -> float:
         global_e = self._baseline.global_energy(node.fv, node.dst, node.dstp)
         if node.degree < MIN_EDGES:
@@ -272,6 +288,7 @@ class FlowGraph:
 
         return ((1 - ALPHA) * global_e) + (ALPHA * local_e)
 
+    # returns different energies for specific node
     def energy_parts(self, node: FlowNode) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         global_per_feature = self._baseline.perf_energy(node.fv, node.dst, node.dstp)
         global_e = float(global_per_feature.sum())
@@ -288,6 +305,7 @@ class FlowGraph:
         combined = ((1 - ALPHA) * global_per_feature) + (ALPHA * local_per_feature)
         return global_per_feature, local_per_feature, combined
 
+    # prints feature explanation
     def explain_prediction(self, flow_id):
         print("\n\n" + "-"*120)
         denom_n = denom.to_numpy()
@@ -341,6 +359,7 @@ class FlowGraph:
             print(f"Top {FEATURES_TO_DISPLAY} Feature Contributions for flow {flow_id}: ({srcip}:{srcp} -> {dstip}:{dstp}) ({protocol})")
             for (idx, row) in table.head(FEATURES_TO_DISPLAY).iterrows():
                 sign_text = "increased" if row["DIFFERENCE"] >= 0 else "decreased"
+                sign = "+" if row["DIFFERENCE"] >= 0 else "-"
                 var_text: str
                 if row["BASE VARIANCE"] >= 0.01:
                     var_text = "high"
@@ -349,7 +368,8 @@ class FlowGraph:
                 else:
                     var_text = "low"
                 scaled_difference = abs((row["DIFFERENCE"]*denom[row["FEATURE"]]) + mins[row["FEATURE"]])
-                print(f"{row["FEATURE"]:>25} {sign_text} by {scaled_difference:,.3f} compared to the neighbour mean of {row["INIT MEAN"]:,.3f} paired with a {var_text} standard deviation of {row["INIT STDEV"]:,.6f} contributed {row["ENERGY"]:,.3f} total energy")
+                stdev_change = int(scaled_difference/row["INIT STDEV"])
+                print(f"{row["FEATURE"]:>25} {sign_text} by {scaled_difference:,.3f} compared to the neighbour mean of {row["INIT MEAN"]:,.3f} paired with a {var_text} standard deviation of {row["INIT STDEV"]:,.6f} ({sign}{stdev_change:,}σ) contributed {row["ENERGY"]:,.3f} total energy")
 
         print(f"Total Energy: {energy:.2f} ({combined.sum()})")
         print(f"Predicted anomalous: {prediction}")
@@ -358,6 +378,7 @@ class FlowGraph:
         print(f"Shannon: {shannon}")
         print(f"Flow Timestamp: {test_identification.at[flow_id, "Timestamp"]}") 
 
+    # match each flow to find anomalous flows
     def find_anomalies(self, test_identification: pd.DataFrame):
         start = time.perf_counter()
         print("finding anomalies")
@@ -389,7 +410,7 @@ class FlowGraph:
             topk_features.append(topk)
             true_is_malicious.append(is_malicious)
 
-
+            # print TP and FN explanations for each class to debug
             if (not explanations_given[label][0]) and (energy > ENERGY_THRESHOLD):
                 self.explain_prediction(id)
                 explanations_given[label][0] = True
@@ -408,6 +429,8 @@ class FlowGraph:
         detect_time = time.perf_counter() - start
         print(f"Find Anomalies time: {detect_time:.6f}")
 
+
+        # calculate stats for the run
         attack_labels = test_identification.loc[[int(i) for i in flow_ids], "Label"].values
         unique_labels = sorted(set(attack_labels))
 
@@ -468,6 +491,7 @@ class FlowGraph:
         print(f"TPR:        {global_recall:.4f}")
         print("-" * 70)
 
+        # save snapshot of run statistics so i don't have to re-run later
         label = f"all-full-{TIME_BIN_SIZE_S}"
         snapshot = {
                 "label": label,
@@ -502,11 +526,13 @@ class FlowGraph:
         with open(filepath, "w") as f:
             json.dump(snapshot, f)
 
+    # return top contributing features
     def topk_features(self, feature_energy: np.ndarray):
         sorted_desc = np.argsort(feature_energy)[::-1]
         total = np.sum(feature_energy)
         return [[int(i), float(feature_energy[i])] for i in sorted_desc[:TOPK]]
 
+    # return all features above 1 energy
     def all_features(self, feature_energy: np.ndarray):
         sorted_desc = np.argsort(feature_energy)[::-1]
         return [[int(i), float(feature_energy[i])] for i in sorted_desc if feature_energy[i] > 1]
@@ -521,10 +547,9 @@ class FlowGraph:
 
         return -np.sum(p * np.log(p + eps))
 
-
+# read dataset files and assign global vars
 dataset_folder = "./dataset"
 dataset_files = Path(dataset_folder).rglob("*.csv") 
-print(dataset_files)
 start = time.perf_counter()
 data = pd.concat((pd.read_csv(file) for file in dataset_files if file.name != "monday.csv"), ignore_index=True)
 data["id"] = data.index
@@ -544,7 +569,7 @@ for (idx, feature_name) in enumerate(test_data.columns.values):
     feature_idx_map[feature_name] = idx
 timestart = to_microseconds(test_identification["Timestamp"].iloc[0])
 
-
+# run model
 baseline = BaselineGraph(feature_len=len(benign_data.columns))
 baseline.initialize_from_df(benign_data, benign_identification)
 
